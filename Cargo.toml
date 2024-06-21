@@ -8,6 +8,7 @@ fastrand = { version = "2.0", default-features = false }
 futures-core = { version = "0.3", default-features = false }
 pin-project-lite = "0.2.0"
 async-task = "4.7"
+flume = "0.11"
 # concurrent-queue = "2"
 slab = "0.4"
 # parking = "2.2"

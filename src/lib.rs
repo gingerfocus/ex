@@ -8,10 +8,12 @@
 
 pub mod futures;
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, Waker};
 
 use crate::futures::future::{self, Future, FutureExt};
@@ -52,7 +54,8 @@ pub use async_task::{FallibleTask, Task};
 /// ```
 pub struct Executor<'a> {
     /// The executor state.
-    state: *mut State,
+    // state: *mut State,
+    state: Box<State>,
 
     /// Makes the `'a` lifetime invariant.
     _marker: PhantomData<std::cell::UnsafeCell<&'a ()>>,
@@ -63,12 +66,10 @@ impl RefUnwindSafe for Executor<'_> {}
 
 impl fmt::Debug for Executor<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state();
-
         f.debug_struct("Executor")
-            .field("active", &state.active.len())
-            .field("global_tasks", &state.queue.len())
-            .field("sleepers", &state.sleepers.count)
+            .field("active", &self.state.active.borrow().len())
+            .field("global_tasks", &self.state.queue.borrow().len())
+            .field("sleepers", &self.state.sleepers.borrow().count)
             .finish()
     }
 }
@@ -86,7 +87,8 @@ impl<'a> Executor<'a> {
     pub fn new() -> Executor<'a> {
         let state = Box::new(State::new());
         Executor {
-            state: Box::into_raw(state),
+            // state: Box::into_raw(state),
+            state,
             _marker: PhantomData,
         }
     }
@@ -111,7 +113,7 @@ impl<'a> Executor<'a> {
     /// ```
     pub fn is_empty(&self) -> bool {
         // SAFETY: this doesnt change the state in anyway so it is safe to do
-        self.state().active.is_empty()
+        self.state.active.borrow().is_empty()
     }
 
     /// Spawns a task onto the executor.
@@ -128,99 +130,39 @@ impl<'a> Executor<'a> {
     /// });
     /// ```
     pub fn spawn<T: Send + 'a>(&mut self, future: impl Future<Output = T> + 'a) -> Task<T> {
-        // SAFETY: `T` and the future are `Send`.
-        self.spawn_inner(future, &mut self.state().active)
-    }
-
-    /// Spawns many tasks onto the executor.
-    ///
-    /// As opposed to the [`spawn`] method, this locks the executor's inner task lock once and
-    /// spawns all of the tasks in one go. With large amounts of tasks this can improve
-    /// contention.
-    ///
-    /// For very large numbers of tasks the lock is occasionally dropped and re-acquired to
-    /// prevent runner thread starvation. It is assumed that the iterator provided does not
-    /// block; blocking iterators can lock up the internal mutex and therefore the entire
-    /// executor.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use async_executor::Executor;
-    /// use futures_lite::{stream, prelude::*};
-    /// use std::future::ready;
-    ///
-    /// # futures_lite::future::block_on(async {
-    /// let mut ex = Executor::new();
-    ///
-    /// let futures = [
-    ///     ready(1),
-    ///     ready(2),
-    ///     ready(3)
-    /// ];
-    ///
-    /// // Spawn all of the futures onto the executor at once.
-    /// let mut tasks = vec![];
-    /// ex.spawn_many(futures, &mut tasks);
-    ///
-    /// // Await all of them.
-    /// let results = ex.run(async move {
-    ///     stream::iter(tasks).then(|x| x).collect::<Vec<_>>().await
-    /// }).await;
-    /// assert_eq!(results, [1, 2, 3]);
-    /// # });
-    /// ```
-    ///
-    /// [`spawn`]: Executor::spawn
-    pub fn spawn_many<T: Send + 'a, F: Future<Output = T> + Send + 'a>(
-        &self,
-        futures: impl IntoIterator<Item = F>,
-        handles: &mut impl Extend<Task<F::Output>>,
-    ) {
-        let mut active = &mut self.state().active;
-
-        // Convert the futures into tasks.
-        let tasks = futures.into_iter().map(move |future| {
-            // SAFETY: `T` and the future are `Send`.
-            let task = self.spawn_inner(future, &mut active);
-
-            task
-        });
-
-        // Push the tasks to the user's collection.
-        handles.extend(tasks);
-    }
-
-    /// Spawn a future while holding the inner lock.
-    ///
-    /// # Safety
-    ///
-    /// If this is an `Executor`, `F` and `T` must be `Send`.
-    fn spawn_inner<T: 'a>(
-        &self,
-        future: impl Future<Output = T> + 'a,
-        active: &mut Slab<Waker>,
-    ) -> Task<T> {
         // Remove the task from the set of active tasks when the future finishes.
+        let mut active = self.state.active.borrow_mut();
         let entry = active.vacant_entry();
         let index = entry.key();
-        let state = self.state();
+
+        let state = &self.state;
         let future = async move {
-            let _guard = CallOnDrop(move || drop(state.active.try_remove(index)));
+            let _guard = CallOnDrop(move || drop(state.active.borrow_mut().try_remove(index)));
             future.await
         };
+
+        // high order function that creates that sends runnable to the executor
+        fn schedule(state: &State) -> impl Fn(Runnable) + '_ {
+            move |runnable| {
+                state.queue.borrow_mut().push_back(runnable);
+                state.notify();
+            }
+        }
 
         // Create the task and register it in the set of active tasks.
         //
         // SAFETY:
         //
-        // Nothing here outlives the executor and the tasks dont need to be
-        // `Send` + `Sync` beacuse this is not.
+        // Nothing here outlives the executor and the tasks dont need to be `Send` + `Sync` beacuse
+        // this is not. This future must be dropped on this thread as it has no way to change
+        // theads.
         let (runnable, task) = unsafe {
             Builder::new()
                 .propagate_panic(true)
-                .spawn_unchecked(|()| future, self.schedule())
+                .spawn_unchecked(|()| future, schedule(&self.state))
         };
+        // unsafe { async_task::spawn_unchecked(future, schedule(&self.state)) };
+        // async_task::spawn_local(future, schedule)
         entry.insert(runnable.waker());
 
         runnable.schedule();
@@ -245,12 +187,12 @@ impl<'a> Executor<'a> {
     /// assert!(ex.try_tick()); // a task was found
     /// ```
     pub fn try_tick(&mut self) -> bool {
-        match self.state().queue.pop_front() {
+        match self.state.queue.borrow_mut().pop_front() {
             None => false,
             Some(runnable) => {
                 // Notify another ticker now to pick up where this ticker left off, just in case
                 // running the task takes a long time.
-                self.state().notify();
+                self.state.notify();
 
                 // Run the task.
                 runnable.run();
@@ -279,8 +221,7 @@ impl<'a> Executor<'a> {
     /// future::block_on(ex.tick()); // runs the task
     /// ```
     pub async fn tick(&self) {
-        let state = self.state();
-        let runnable = Ticker::new(state).runnable().await;
+        let runnable = Ticker::new(&self.state).runnable().await;
         runnable.run();
     }
 
@@ -299,7 +240,7 @@ impl<'a> Executor<'a> {
     ///
     /// assert_eq!(res, 6);
     /// ```
-    pub async fn run<T>(&self, future: impl Future<Output = T>) -> T {
+    pub async fn run<T>(&mut self, future: impl Future<Output = T>) -> T {
         //let mut runner = Runner::new(self.state());
         //let mut rng = fastrand::Rng::with_seed(0xfa3c12e);
 
@@ -308,7 +249,7 @@ impl<'a> Executor<'a> {
             loop {
                 for _ in 0..200 {
                     self.tick().await;
-                    //if let Some(runnable) = self.state().queue.pop_front() {
+                    //if let Some(runnable) = self.state.queue.borrow_mut().pop_front() {
                     //    runnable.run();
                     //}
                 }
@@ -319,44 +260,15 @@ impl<'a> Executor<'a> {
         // Run `future` and `run_forever` concurrently until `future` completes.
         future.or(run_forever).await
     }
-
-    /// Returns a function that schedules a runnable task when it gets woken up.
-    fn schedule(&self) -> impl Fn(Runnable) + 'static {
-        let state = self.state;
-
-        // TODO: If possible, push into the current local queue and notify the ticker.
-        move |runnable| {
-            let mut state = unsafe { state.read() };
-            state.queue.push_back(runnable);
-            state.notify();
-        }
-    }
-
-    /// Returns a reference to the inner state.
-    #[inline]
-    fn state(&self) -> &mut State {
-        // SAFETY: So long as an Executor lives, it's state pointer will always be valid
-        unsafe { &mut *self.state }
-    }
 }
 
 impl Drop for Executor<'_> {
     fn drop(&mut self) {
-        let ptr = self.state;
-        if ptr.is_null() {
-            return;
-        }
-
-        // SAFETY: As ptr is not null, it was allocated via Box::new and converted
-        // via Box::into_raw in state_ptr.
-        let mut state = unsafe { Box::from_raw(ptr) };
-
-        let active = &mut state.active;
-        for w in active.drain() {
+        for w in self.state.active.get_mut().drain() {
             w.wake();
         }
 
-        while state.queue.pop_front().is_some() {}
+        while self.state.queue.get_mut().pop_front().is_some() {}
     }
 }
 
@@ -369,39 +281,42 @@ impl<'a> Default for Executor<'a> {
 /// The state of a executor.
 struct State {
     /// The global queue.
-    queue: VecDeque<Runnable>,
+    queue: RefCell<VecDeque<Runnable>>,
 
     /// Set to `true` when a sleeping ticker is notified or no tickers are sleeping.
-    notified: bool,
+    notified: AtomicBool,
 
     /// A list of sleeping tickers.
-    sleepers: Sleepers,
+    sleepers: RefCell<Sleepers>,
 
     /// Currently active tasks.
-    active: Slab<Waker>,
+    active: RefCell<Slab<Waker>>,
 }
 
 impl State {
     /// Creates state for a new executor.
     fn new() -> State {
         State {
-            queue: VecDeque::new(),
-            notified: true,
-            sleepers: Sleepers {
+            queue: RefCell::new(VecDeque::new()),
+            notified: AtomicBool::new(true),
+            sleepers: RefCell::new(Sleepers {
                 count: 0,
                 wakers: Vec::new(),
                 free_ids: Vec::new(),
-            },
-            active: Slab::new(),
+            }),
+            active: RefCell::new(Slab::new()),
         }
     }
 
     /// Notifies a sleeping ticker.
     #[inline]
-    fn notify(&mut self) {
-        if !self.notified {
-            self.notified = true;
-            let waker = self.sleepers.notify();
+    fn notify(&self) {
+        if self
+            .notified
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let waker = self.sleepers.borrow_mut().notify();
             if let Some(w) = waker {
                 w.wake();
             }
@@ -486,8 +401,7 @@ impl Sleepers {
 /// Runs task one by one.
 struct Ticker<'a> {
     /// The executor state.
-    state: *mut State,
-    makerer: PhantomData<&'a mut State>,
+    state: &'a State,
 
     /// Set to a non-zero sleeper ID when in sleeping state.
     ///
@@ -501,16 +415,7 @@ struct Ticker<'a> {
 impl Ticker<'_> {
     /// Creates a ticker.
     fn new(state: &State) -> Ticker<'_> {
-        Ticker {
-            state: state as *const State as *mut State,
-            makerer: PhantomData,
-            sleeping: 0,
-        }
-    }
-
-    #[inline]
-    fn state(&self) -> &'_ mut State {
-        unsafe { &mut *self.state }
+        Ticker { state, sleeping: 0 }
     }
 
     /// Moves the ticker into sleeping and unnotified state.
@@ -520,18 +425,21 @@ impl Ticker<'_> {
         match self.sleeping {
             // Move to sleeping state.
             0 => {
-                self.sleeping = self.state().sleepers.insert(waker);
+                self.sleeping = self.state.sleepers.borrow_mut().insert(waker);
             }
 
             // Already sleeping, check if notified.
             id => {
-                if !self.state().sleepers.update(id, waker) {
+                if !self.state.sleepers.borrow_mut().update(id, waker) {
                     return false;
                 }
             }
         }
 
-        self.state().notified = self.state().sleepers.is_notified();
+        self.state.notified.store(
+            self.state.sleepers.borrow_mut().is_notified(),
+            Ordering::Relaxed,
+        );
 
         true
     }
@@ -539,19 +447,20 @@ impl Ticker<'_> {
     /// Moves the ticker into woken state.
     fn wake(&mut self) {
         if self.sleeping != 0 {
-            let sleepers = &mut self.state().sleepers;
-            sleepers.remove(self.sleeping);
+            let sleepers = &self.state.sleepers;
+            sleepers.borrow_mut().remove(self.sleeping);
 
-            self.state().notified = sleepers.is_notified();
+            self.state
+                .notified
+                .store(sleepers.borrow().is_notified(), Ordering::Relaxed);
         }
         self.sleeping = 0;
     }
 
     /// Waits for the next runnable task to run.
     async fn runnable(&mut self) -> Runnable {
-        let state = unsafe { &mut *self.state };
         future::poll_fn(|cx| loop {
-            let task = state.queue.pop_front();
+            let task = self.state.queue.borrow_mut().pop_front();
             match task {
                 None => {
                     // Move to sleeping and unnotified state.
@@ -566,7 +475,7 @@ impl Ticker<'_> {
 
                     // Notify another ticker now to pick up where this ticker left off, just in
                     // case running the task takes a long time.
-                    state.notify();
+                    self.state.notify();
 
                     return Poll::Ready(r);
                 }
@@ -580,14 +489,16 @@ impl Drop for Ticker<'_> {
     fn drop(&mut self) {
         // If this ticker is in sleeping state, it must be removed from the sleepers list.
         if self.sleeping != 0 {
-            let sleepers = &mut self.state().sleepers;
-            let notified = sleepers.remove(self.sleeping);
+            let sleepers = &self.state.sleepers;
+            let notified = sleepers.borrow_mut().remove(self.sleeping);
 
-            self.state().notified = sleepers.is_notified();
+            self.state
+                .notified
+                .store(sleepers.borrow().is_notified(), Ordering::Relaxed);
 
             // If this ticker was notified, then notify another ticker.
             if notified {
-                self.state().notify();
+                self.state.notify();
             }
         }
     }
