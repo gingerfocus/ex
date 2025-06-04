@@ -1,17 +1,11 @@
 [package]
 name = "ex"
 version = "0.0.1"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-fastrand = { version = "2.0", default-features = false }
-futures-core = { version = "0.3", default-features = false }
 pin-project-lite = "0.2.0"
 async-task = "4.7"
-flume = "0.11"
-# concurrent-queue = "2"
+concurrent-queue = "2"
 slab = "0.4"
-# parking = "2.2"
-
-# [dev-dependencies]
-# waker-fn = "1.0.0" # used in doctests
+parking = "2.2"

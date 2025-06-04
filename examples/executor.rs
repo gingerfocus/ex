@@ -1,8 +1,3 @@
-# Ex
-A very very very tiny executor. A feature stripped version of [smol](https://crates.io/crates/smol).
-
-Making an executor is as simple as this:
-```rust
 use ex::Executor;
 
 fn main() {
@@ -18,6 +13,3 @@ fn main() {
 
     handle.join().unwrap();
 }
-```
-
-*A Suckmore Software project.*

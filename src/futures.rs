@@ -3,16 +3,26 @@
 //! # Examples
 //!
 //! ```
-//! use futures_lite::future;
+//! use ex::futures;
 //!
-//! # spin_on::spin_on(async {
+//! # futures::block_on(async {
 //! for step in 0..3 {
 //!     println!("step {}", step);
 //!
 //!     // Give other tasks a chance to run.
-//!     future::yield_now().await;
+//!     futures::yield_now().await;
 //! }
 //! # });
+//! ```
+//!
+//! ```
+//! use ex::futures;
+//!
+//! fn main() {
+//!     futures::block_on(async {
+//!         println!("Hello world!");
+//!     })
+//! }
 //! ```
 
 #[doc(no_inline)]
@@ -21,8 +31,40 @@ pub use core::future::{pending, ready, Future, Pending, Ready};
 use core::fmt;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-
 use pin_project_lite::pin_project;
+
+/// Pins a variable of type `T` on the stack and rebinds it as `Pin<&mut T>`.
+///
+/// ```
+/// use futures_lite::{future, pin};
+/// use std::fmt::Debug;
+/// use std::future::Future;
+/// use std::pin::Pin;
+/// use std::time::Instant;
+///
+/// // Inspects each invocation of `Future::poll()`.
+/// async fn inspect<T: Debug>(f: impl Future<Output = T>) -> T {
+///     pin!(f);
+///     future::poll_fn(|cx| dbg!(f.as_mut().poll(cx))).await
+/// }
+///
+/// # spin_on::spin_on(async {
+/// let f = async { 1 + 2 };
+/// inspect(f).await;
+/// # })
+/// ```
+#[macro_export]
+macro_rules! pin {
+    ($($x:ident),* $(,)?) => {
+        $(
+            let mut $x = $x;
+            #[allow(unused_mut)]
+            let mut $x = unsafe {
+                core::pin::Pin::new_unchecked(&mut $x)
+            };
+        )*
+    }
+}
 
 /// Blocks the current thread on a future.
 ///
@@ -41,7 +83,7 @@ pub fn block_on<T>(future: impl Future<Output = T>) -> T {
     use core::cell::RefCell;
     use core::task::Waker;
 
-    use crate::futures::parking::Parker;
+    use parking::Parker;
 
     // Pin the future on the stack.
     crate::pin!(future);
@@ -88,68 +130,20 @@ pub fn block_on<T>(future: impl Future<Output = T>) -> T {
     })
 }
 
-/// Polls a future just once and returns an [`Option`] with the result.
-///
-/// # Examples
-///
-/// ```
-/// use futures_lite::future;
-///
-/// # spin_on::spin_on(async {
-/// assert_eq!(future::poll_once(future::pending::<()>()).await, None);
-/// assert_eq!(future::poll_once(future::ready(42)).await, Some(42));
-/// # })
-/// ```
-pub fn poll_once<T, F>(f: F) -> PollOnce<F>
-where
-    F: Future<Output = T>,
-{
-    PollOnce { f }
-}
-
-pin_project! {
-    /// Future for the [`poll_once()`] function.
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct PollOnce<F> {
-        #[pin]
-        f: F,
-    }
-}
-
-impl<F> fmt::Debug for PollOnce<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PollOnce").finish()
-    }
-}
-
-impl<T, F> Future for PollOnce<F>
-where
-    F: Future<Output = T>,
-{
-    type Output = Option<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.project().f.poll(cx) {
-            Poll::Ready(t) => Poll::Ready(Some(t)),
-            Poll::Pending => Poll::Ready(None),
-        }
-    }
-}
-
 /// Creates a future from a function returning [`Poll`].
 ///
 /// # Examples
 ///
 /// ```
-/// use futures_lite::future;
+/// use ex::futures;
 /// use std::task::{Context, Poll};
 ///
-/// # spin_on::spin_on(async {
+/// # futures::block_on(async {
 /// fn f(_: &mut Context<'_>) -> Poll<i32> {
 ///     Poll::Ready(7)
 /// }
 ///
-/// assert_eq!(future::poll_fn(f).await, 7);
+/// assert_eq!(futures::poll_fn(f).await, 7);
 /// # })
 /// ```
 pub fn poll_fn<T, F>(f: F) -> PollFn<F>
@@ -308,9 +302,6 @@ where
 
 /// Returns the result of the future that completes first, preferring `future1` if both are ready.
 ///
-/// If you need to treat the two futures fairly without a preference for either, use the [`race()`]
-/// function or the [`FutureExt::race()`] method.
-///
 /// # Examples
 ///
 /// ```
@@ -375,9 +366,6 @@ pub trait FutureExt: Future {
     }
 
     /// Returns the result of `self` or `other` future, preferring `self` if both are ready.
-    ///
-    /// If you need to treat the two futures fairly without a preference for either, use the
-    /// [`race()`] function or the [`FutureExt::race()`] method.
     ///
     /// # Examples
     ///
